@@ -33,6 +33,53 @@
     <script>
         const nodes = {};
 
+        // Same temporary test key used on the ESP32 (AES_KEY in the .ino).
+        // Must match exactly, 16 bytes.
+        const AES_KEY_BYTES = new Uint8Array([
+            0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0A, 0x0B,
+            0x0C, 0x0D, 0x0E, 0x0F
+        ]);
+
+        let aesKeyPromise = crypto.subtle.importKey(
+            'raw',
+            AES_KEY_BYTES,
+            { name: 'AES-GCM' },
+            false,
+            ['decrypt']
+        );
+
+        function base64ToBytes(b64) {
+            const binary = atob(b64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+            }
+            return bytes;
+        }
+
+        async function decryptEnvelope(envelope) {
+            const key = await aesKeyPromise;
+            const nonce = base64ToBytes(envelope.nonce);
+            const ciphertext = base64ToBytes(envelope.ciphertext);
+            const tag = base64ToBytes(envelope.tag);
+
+            // Web Crypto expects ciphertext + tag concatenated for AES-GCM.
+            const combined = new Uint8Array(ciphertext.length + tag.length);
+            combined.set(ciphertext, 0);
+            combined.set(tag, ciphertext.length);
+
+            const plaintextBuffer = await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv: nonce, tagLength: 128 },
+                key,
+                combined
+            );
+
+            const plaintextText = new TextDecoder().decode(plaintextBuffer);
+            return JSON.parse(plaintextText);
+        }
+
         const client = mqtt.connect('wss://955582be306a4529b8874ee52640cc86.s1.eu.hivemq.cloud:8884/mqtt', {
             username: 'STP THING',
             password: 'GROUP3STPTHING'
@@ -43,10 +90,15 @@
             client.subscribe('rf-telemetry/+');
         });
 
-        client.on('message', (topic, message) => {
-            const data = JSON.parse(message.toString());
-            nodes[data.node_id] = { ...data, lastSeen: Date.now() };
-            render();
+        client.on('message', async (topic, message) => {
+            try {
+                const envelope = JSON.parse(message.toString());
+                const data = await decryptEnvelope(envelope);
+                nodes[data.node_id] = { ...data, lastSeen: Date.now() };
+                render();
+            } catch (err) {
+                console.error('Failed to decrypt/parse message on', topic, err);
+            }
         });
 
         function render() {
